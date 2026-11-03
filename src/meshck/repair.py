@@ -10,7 +10,8 @@ problem it addresses:
    shell at a time; leftovers that enclose no volume are removed.
 5. Merge overlapping shells into one solid with a boolean union.
 
-Separate shells and cavities are kept as they are.
+Separate shells and cavities are kept as they are. Self-intersecting shells
+are not repaired.
 """
 
 from dataclasses import dataclass

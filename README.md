@@ -72,12 +72,17 @@ read or written.
 | Open mesh (holes, boundary edges) | error |
 | Edges shared by more than two triangles | error |
 | Misoriented triangles (including inverted parts and cavities) | error |
-| Overlapping shells | error |
+| Triangles crossing other triangles of the same shell | error |
+| Overlapping shells, including a solid inside a solid | error |
 | Degenerate (zero-area) triangles | warning |
 | Several separate parts | warning |
 
 Separate parts are only a warning because moving parts printed in one piece
 are separate by design. Size and volume are reported without a limit.
+
+A closed shell inside another one is a cavity if it points inwards and a
+solid inside a solid if it points outwards. Crossings less than 1 µm deep are
+ignored as rounding noise.
 
 ## What repair does
 
@@ -96,7 +101,8 @@ Each step runs only if the check finds the problem it addresses:
 holes and inner walls removed by a merge are not counted, deleted shells are.
 
 Cavities and separate parts are kept. meshck does not rebuild the whole outer
-surface. If the steps above are not enough, the mesh has to be fixed by hand.
+surface and does not repair self-intersecting shells. If the steps above are
+not enough, the mesh has to be fixed by hand.
 
 ## Python API
 

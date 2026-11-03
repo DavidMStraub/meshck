@@ -88,10 +88,46 @@ def test_cavity():
     assert result.volume == pytest.approx(1000 - 8)
 
 
-def test_solid_inside_solid_is_misoriented():
+def test_solid_inside_solid_overlaps():
     result = analyze(*combine(box(), box(2)))
-    assert result.misoriented.sum() == 12
-    assert result.volume == pytest.approx(1000 - 8)
+    assert not result.misoriented.any()
+    assert result.overlapping == [(0, 1)]
+
+
+def test_cavity_with_few_flipped_triangles():
+    v, f = combine(box(), inverted(box(2)))
+    f = f.copy()
+    f[12:14] = f[12:14, ::-1]
+    result = analyze(v, f)
+    assert result.misoriented.sum() == 2
+    assert result.overlapping == []
+
+
+def test_self_intersecting_shell():
+    v, f = combine(box())
+    v = v.copy()
+    v[np.argmax(v.sum(axis=1))] = [-8, -8, -8]  # push a corner through the opposite side
+    result = analyze(v, f)
+    assert result.self_intersecting.any()
+    assert result.boundary_edges == 0
+
+
+def test_crossings_below_one_micrometre_are_ignored():
+    v, f = combine(box(size=1e-3))
+    v = v.copy()
+    v[np.argmax(v.sum(axis=1))] = [-8e-4, -8e-4, -8e-4]
+    assert not analyze(v, f).self_intersecting.any()
+
+
+def test_no_self_intersections_in_valid_meshes():
+    for mesh in (combine(box(), inverted(box(2))), combine(box(), box(center=(5, 0, 0))),
+                 (trimesh.creation.icosphere(4).vertices, trimesh.creation.icosphere(4).faces)):
+        assert not analyze(*mesh).self_intersecting.any()
+
+
+def test_empty_mesh():
+    result = analyze(np.zeros((0, 3)), np.zeros((0, 3), dtype=int))
+    assert result.triangles == 0
 
 
 def test_part_inside_cavity():

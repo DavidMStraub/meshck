@@ -95,6 +95,7 @@ def metrics(result: Analysis) -> Metrics:
         "boundary_edges": result.boundary_edges,
         "holes": result.holes,
         "misoriented": int(result.misoriented.sum()),
+        "self_intersecting": int(result.self_intersecting.sum()),
         "nonmanifold_edges": result.nonmanifold_edges,
         "degenerate": int(result.degenerate.sum()),
         "size_mm": [round(v, 3) for v in result.size],
@@ -113,6 +114,10 @@ def check_topology(result: Analysis, report: Report) -> None:
     misoriented = int(result.misoriented.sum())
     if misoriented:
         report.add("oriented", Severity.ERROR, f"{misoriented} misoriented triangles")
+    crossing = int(result.self_intersecting.sum())
+    if crossing:
+        report.add("self_intersecting", Severity.ERROR,
+                   f"{crossing} triangles cross other triangles of the same shell")
     degenerate = int(result.degenerate.sum())
     if degenerate:
         report.add("degenerate", Severity.WARN, f"{degenerate} triangles have zero area")
@@ -122,7 +127,7 @@ def check_shells(result: Analysis, report: Report) -> None:
     """Add findings for meshes made of several shells."""
     if result.overlapping:
         report.add("shells.overlapping", Severity.ERROR,
-                   f"{len(result.overlapping)} pair(s) of shells intersect each other")
+                   f"{len(result.overlapping)} pair(s) of shells overlap")
     parts = sum(1 for s in result.shells if s.depth % 2 == 0)
     if parts > 1:
         report.add("shells.separate", Severity.WARN,

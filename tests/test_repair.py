@@ -110,6 +110,22 @@ def test_cavity_and_separate_parts_kept():
     assert result.steps == []
 
 
+def test_solid_inside_solid_merged():
+    result = repair(*combine(box(), box(2)))
+    assert result.steps == ["merged 2 overlapping shells into 1"]
+    after = assert_clean(result)
+    assert len(after.shells) == 1
+    assert after.volume == pytest.approx(1000)
+    assert result.deviation == pytest.approx(0, abs=1e-6)
+
+
+def test_self_intersection_is_not_hidden():
+    v, f = combine(box())
+    v = v.copy()
+    v[np.argmax(v.sum(axis=1))] = [-8, -8, -8]
+    assert repair(v, f).analysis.self_intersecting.any()
+
+
 def test_stray_triangle_removed():
     v, f = combine(box())
     v = np.vstack([v, [[20, 0, 0], [21, 0, 0], [20, 1, 0]]])
