@@ -1,0 +1,36 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 5 * * 1"  # weekly, to catch breakage from new dependency releases
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}${{ matrix.upgrade && ' / latest deps' || '' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.13"]
+        upgrade: [false]
+        include:
+          - { os: ubuntu-latest, python: "3.11", upgrade: false }
+          - { os: ubuntu-latest, python: "3.14", upgrade: false }
+          - { os: ubuntu-latest, python: "3.14", upgrade: true }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install (locked)
+        if: ${{ !matrix.upgrade }}
+        run: uv sync --locked
+      - name: Install (latest dependency releases)
+        if: ${{ matrix.upgrade }}
+        run: uv sync --upgrade
+      - run: uv run pytest -q
