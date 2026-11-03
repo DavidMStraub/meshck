@@ -1,0 +1,40 @@
+[project]
+name = "meshck"
+version = "0.1.0.dev0"
+description = "Check and repair triangle meshes (STL) before additive manufacturing"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "David Straub" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+dependencies = [
+    "manifold3d>=3.5.4",
+    "numpy",
+    "pymeshfix",
+    "rtree>=1.4.1",
+    "scipy>=1.17.1",
+    "trimesh",
+]
+
+[project.scripts]
+meshck = "meshck.cli:main"
+
+[dependency-groups]
+dev = ["pytest"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+# Same platforms as the CAx course stack: every dependency must ship wheels.
+required-environments = [
+    "sys_platform == 'win32' and platform_machine == 'AMD64'",
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sys_platform == 'darwin' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
