@@ -11,13 +11,13 @@ Status: early development.
 ## Installation
 
 ```sh
-pip install git+https://github.com/DavidMStraub/meshck
+pip install meshck
 ```
 
 or, in a uv project:
 
 ```sh
-uv add git+https://github.com/DavidMStraub/meshck
+uv add meshck
 ```
 
 Requires Python 3.11 or newer.
@@ -137,4 +137,4 @@ rules such as wall thickness, build volume or clearances.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](https://github.com/DavidMStraub/meshck/blob/main/LICENSE).

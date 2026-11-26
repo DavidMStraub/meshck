@@ -1,6 +1,6 @@
 [project]
 name = "meshck"
-version = "0.1.0.dev0"
+version = "0.1.0"
 description = "Check and repair triangle meshes (STL) before additive manufacturing"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,6 +19,9 @@ dependencies = [
     "scipy>=1.17.1",
     "trimesh",
 ]
+
+[project.urls]
+Repository = "https://github.com/DavidMStraub/meshck"
 
 [project.scripts]
 meshck = "meshck.cli:main"
