@@ -28,6 +28,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="repair and write a fixed copy (default: FILE_repaired.stl)")
     parser.add_argument("-o", "--output", type=Path, metavar="OUT",
                         help="where to write the repaired copy (only with --repair and one FILE)")
+    parser.add_argument("--fill-cavities", action="store_true",
+                        help="when repairing, also fill cavities so that only outer surfaces remain")
     parser.add_argument("--strict", action="store_true", help="treat warnings as errors")
     parser.add_argument("--json", action="store_true", help="print results as JSON")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -50,13 +52,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.output and not args.repair:
         parser.error("--output requires --repair")
+    if args.fill_cavities and not args.repair:
+        parser.error("--fill-cavities requires --repair")
     if args.output and len(args.files) > 1:
         parser.error("--output works with a single FILE only")
 
     reports, exit_code = [], EXIT_PASS
     for path in args.files:
         try:
-            report = repair_file(path, args.output) if args.repair else check_file(path)
+            report = (repair_file(path, args.output, args.fill_cavities) if args.repair
+                      else check_file(path))
         except (LoadError, OSError) as exc:
             print(f"meshck: {exc}", file=sys.stderr)
             exit_code = EXIT_ERROR
@@ -73,7 +78,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     return exit_code
 
 
-def repair_file(path: Path, output: Path | None = None) -> Report:
+def repair_file(path: Path, output: Path | None = None, fill_cavities: bool = False) -> Report:
     """Repair one STL file and check the result.
 
     The repaired copy is written only if repair changed something; the input
@@ -83,6 +88,7 @@ def repair_file(path: Path, output: Path | None = None) -> Report:
         path: The STL file.
         output: Where to write the repaired copy; defaults to
             ``<stem>_repaired.stl`` next to ``path``.
+        fill_cavities: Also fill cavities, see ``repair``.
 
     Returns:
         The report of the repaired copy, or of ``path`` itself if nothing
@@ -95,7 +101,7 @@ def repair_file(path: Path, output: Path | None = None) -> Report:
     mesh = load_mesh(path)
     analysis = analyze(mesh.vertices, mesh.faces)
     before = check_analysis(analysis, path)
-    result = repair(mesh.vertices, mesh.faces, analysis)
+    result = repair(mesh.vertices, mesh.faces, analysis, fill_cavities=fill_cavities)
     if not result.steps:
         return before
 

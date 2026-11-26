@@ -105,6 +105,8 @@ def metrics(result: Analysis) -> Metrics:
 
 def check_topology(result: Analysis, report: Report) -> None:
     """Add findings for rules every printable mesh must meet."""
+    if result.triangles == 0:
+        report.add("empty", Severity.ERROR, "mesh contains no triangles")
     if result.boundary_edges:
         report.add("closed", Severity.ERROR,
                    f"mesh is open: {result.holes} hole(s), {result.boundary_edges} boundary edges")
@@ -128,6 +130,13 @@ def check_shells(result: Analysis, report: Report) -> None:
     if result.overlapping:
         report.add("shells.overlapping", Severity.ERROR,
                    f"{len(result.overlapping)} pair(s) of shells overlap")
+    flat = sum(1 for s in result.shells if s.flat)
+    if flat:
+        report.add("shells.flat", Severity.WARN,
+                   f"{flat} closed shell(s) enclose no volume (zero thickness) and will not print")
+    if result.touching:
+        report.add("shells.touching", Severity.WARN,
+                   f"{len(result.touching)} pair(s) of shells touch over an area and fuse when printed")
     parts = sum(1 for s in result.shells if s.depth % 2 == 0)
     if parts > 1:
         report.add("shells.separate", Severity.WARN,

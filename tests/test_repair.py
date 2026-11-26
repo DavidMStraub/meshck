@@ -75,8 +75,38 @@ def test_shared_wall_cancels():
 
 def test_touching_faces_different_triangulation():
     a, b = box(), box(center=(10, 0, 0))
-    after = assert_clean(repair(*combine(a, b)))
+    result = repair(*combine(a, b))
+    assert result.steps[-1] == "merged 2 touching shells into 1"
+    after = assert_clean(result)
+    assert len(after.shells) == 1
     assert after.volume == pytest.approx(2000)
+
+
+def test_partly_touching_shells_merged():
+    v, f = combine(box(), box(center=(10, 5, 0)))
+    result = repair(v, f)
+    assert result.steps == ["merged 2 touching shells into 1"]
+    assert len(assert_clean(result).shells) == 1
+
+
+def test_fill_cavities():
+    v, f = combine(box(), inverted(box(6)), box(2), box(center=(20, 0, 0)))
+    assert repair(v, f).steps == []
+    result = repair(v, f, fill_cavities=True)
+    assert result.steps == ["filled cavities: removed 2 inner shell(s)"]
+    after = assert_clean(result)
+    assert len(after.shells) == 2
+    assert after.volume == pytest.approx(2000)
+    assert result.deviation == pytest.approx(0, abs=1e-9)
+
+
+def test_cli_fill_cavities(tmp_path):
+    path = tmp_path / "hollow.stl"
+    trimesh.Trimesh(*combine(box(), inverted(box(2)))).export(path)
+    assert main(["--repair", "--fill-cavities", str(path)]) == EXIT_PASS
+    assert len(trimesh.load_mesh(tmp_path / "hollow_repaired.stl").faces) == 12
+    with pytest.raises(SystemExit):
+        main(["--fill-cavities", str(path)])
 
 
 def test_deviation_ignores_filled_hole_but_counts_removed_shell():
@@ -124,6 +154,41 @@ def test_self_intersection_is_not_hidden():
     v = v.copy()
     v[np.argmax(v.sum(axis=1))] = [-8, -8, -8]
     assert repair(v, f).analysis.self_intersecting.any()
+
+
+def test_closed_shell_with_degenerate_triangle_is_kept():
+    """A zero-area sliver in a closed solid is only a warning; repair must not delete the solid."""
+    v, f = combine(box())
+    a, b = f[0][0], f[0][1]
+    other = next(i for i, t in enumerate(f) if i != 0 and a in t and b in t)
+    d = next(x for x in f[other] if x not in (a, b))
+    m = len(v)
+    v = np.vstack([v, (v[a] + v[b]) / 2])
+    f = np.vstack([np.delete(f, other, axis=0), [[b, m, d], [m, a, d], [a, m, b]]])
+    before = analyze(v, f)
+    assert before.boundary_edges == 0 and before.degenerate.sum() == 1
+    result = repair(v, f)
+    assert result.steps == []
+    assert result.analysis.volume == pytest.approx(1000)
+
+
+def test_flat_closed_shell_removed():
+    flat = trimesh.Trimesh([[20, 0, 0], [21, 0, 0], [20, 1, 0], [20.2, 0.2, 0]],
+                           [[0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3]])
+    v, f = combine(box(), flat)
+    before = analyze(v, f)
+    assert [s.flat for s in before.shells].count(True) == 1
+    assert not before.misoriented.any()
+    result = repair(v, f)
+    assert result.steps == ["removed 1 loose surface piece(s) enclosing no volume (4 triangles)"]
+    assert len(assert_clean(result).shells) == 1
+
+
+def test_flat_sheet_alone_is_not_deleted():
+    sheet = trimesh.creation.box(extents=(10, 10, 10))
+    keep = sheet.triangles_center[:, 2] > 4.9  # the two top triangles
+    result = repair(sheet.vertices, sheet.faces[keep])
+    assert len(result.faces) == 2
 
 
 def test_stray_triangle_removed():

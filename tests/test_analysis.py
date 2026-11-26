@@ -1,8 +1,11 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
 import trimesh
 
 from meshck.analysis import analyze
+from meshck.check import check_analysis
 
 
 def box(size=10.0, center=(0, 0, 0)):
@@ -79,6 +82,19 @@ def test_overlapping_shells():
     assert not result.misoriented.any()
 
 
+def test_overlap_counted_once_in_volume():
+    result = analyze(*combine(box(), box(center=(5, 0, 0))))
+    assert result.volume == pytest.approx(1500, rel=1e-4)
+
+
+def test_touching_shells():
+    face = analyze(*combine(box(), box(center=(10, 5, 0))))
+    assert face.touching == [(0, 1)]
+    assert face.overlapping == []
+    corner = analyze(*combine(box(), box(center=(10, 10, 10))))
+    assert corner.touching == []
+
+
 def test_cavity():
     result = analyze(*combine(box(), inverted(box(2))))
     depths = sorted(s.depth for s in result.shells)
@@ -128,6 +144,8 @@ def test_no_self_intersections_in_valid_meshes():
 def test_empty_mesh():
     result = analyze(np.zeros((0, 3)), np.zeros((0, 3), dtype=int))
     assert result.triangles == 0
+    report = check_analysis(result, Path("empty.stl"))
+    assert not report.passed(False)
 
 
 def test_part_inside_cavity():

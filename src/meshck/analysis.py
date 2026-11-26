@@ -15,9 +15,12 @@ Terms:
         inside a solid and counts as overlapping its enclosing shell.
     self-intersecting triangle: A triangle crossing another triangle of the
         same closed shell.
+    touching shells: Closed shells that share part of their surface without
+        overlapping; touching only along an edge or at a point does not count.
 """
 
 from dataclasses import dataclass, field
+from functools import reduce
 
 import numpy as np
 import rtree
@@ -30,6 +33,13 @@ _VOLUME_RTOL = 1e-4
 
 # Triangle pairs tested for crossings at once (bounds memory use).
 _PAIR_CHUNK = 500_000
+
+# A closed shell enclosing less than this fraction of its size cubed is flat;
+# its orientation cannot be decided from the volume.
+FLAT_VOLUME_RTOL = 1e-9
+
+# Point–triangle pairs per batch in the winding-number test (bounds memory use).
+_WINDING_BATCH = 1_000_000
 
 # Crossings shallower than this (mm) are rounding noise, not defects.
 _CROSSING_DEPTH = 1e-3
@@ -46,6 +56,8 @@ class Shell:
             negative for cavities. Only meaningful if ``closed``.
         depth: Number of other shells enclosing this one.
         parent: Index of the innermost shell enclosing this one, or None.
+        flat: True if the shell is closed but encloses no volume, such as a
+            zero-thickness fin whose two sides lie on top of each other.
     """
 
     faces: np.ndarray
@@ -53,6 +65,7 @@ class Shell:
     volume: float = 0.0
     depth: int = 0
     parent: int | None = None
+    flat: bool = False
 
 
 @dataclass
@@ -73,9 +86,11 @@ class Analysis:
         overlapping: Index pairs into ``shells`` of closed shells that
             partially intersect each other, or of a solid and the solid
             enclosing it.
+        touching: Index pairs into ``shells`` of closed shells that touch
+            over an area without overlapping; they fuse when printed.
         size: Axis-aligned extent in mm along x, y and z.
-        volume: Total enclosed volume in mm³ (cavities subtracted), summed
-            over closed shells.
+        volume: Total enclosed volume in mm³ of the closed shells, with
+            cavities subtracted and overlaps counted once.
     """
 
     triangles: int
@@ -88,6 +103,7 @@ class Analysis:
     self_intersecting: np.ndarray
     shells: list[Shell]
     overlapping: list[tuple[int, int]] = field(default_factory=list)
+    touching: list[tuple[int, int]] = field(default_factory=list)
     size: tuple[float, float, float] = (0.0, 0.0, 0.0)
     volume: float = 0.0
 
@@ -180,23 +196,25 @@ def analyze(vertices: np.ndarray, faces: np.ndarray) -> Analysis:
         closed = not open_faces[idx].any()
         # A closed shell is a single patch.
         volume = float(vol_ref[patch_index[int(patch_of[idx[0]])]]) if closed else 0.0
+        extent = float(np.ptp(vertices[faces[idx].ravel()], axis=0).max())
+        flat = closed and abs(volume) <= FLAT_VOLUME_RTOL * max(extent, 1.0) ** 3
         shell_index[int(shell_of[idx[0]])] = len(shells)
-        shells.append(Shell(faces=idx, closed=closed, volume=volume))
+        shells.append(Shell(faces=idx, closed=closed, volume=volume, flat=flat))
 
     oriented = faces.copy()
     oriented[flipped] = oriented[flipped][:, ::-1]
-    overlapping = _nest(vertices, oriented, shells)
+    overlapping, touching, solids = _nest(vertices, oriented, shells)
 
     # Decide per patch which orientation class is correct. Closed patches at
     # even depth must enclose a positive volume. At odd depth the majority of
     # triangles decides: pointing inwards makes a cavity, pointing outwards
-    # a solid inside a solid. Open patches follow the majority.
+    # a solid inside a solid. Open and flat patches follow the majority.
     misoriented = np.zeros(n_faces, dtype=bool)
     for p, idx in enumerate(patches):
         s = shell_index[int(shell_of[idx[0]])]
         shell = shells[s]
         majority_is_ref = (~flipped[idx]).sum() >= flipped[idx].sum()
-        if open_in_patch[idx].any():
+        if open_in_patch[idx].any() or shell.flat:
             ref_correct = majority_is_ref
         elif shell.depth % 2 == 0:
             ref_correct = vol_ref[p] > 0
@@ -209,7 +227,7 @@ def analyze(vertices: np.ndarray, faces: np.ndarray) -> Analysis:
         if shell.closed and not ref_correct:
             shell.volume = -shell.volume
 
-    closed_volume = sum(s.volume for s in shells if s.closed)
+    closed_volume = _total_volume(shells, overlapping, solids)
     x, y, z = (float(v) for v in np.ptp(vertices[faces.ravel()], axis=0)) if n_faces else (0.0, 0.0, 0.0)
     return Analysis(
         triangles=n_faces,
@@ -222,6 +240,7 @@ def analyze(vertices: np.ndarray, faces: np.ndarray) -> Analysis:
         self_intersecting=_self_intersecting(vertices, faces, shells),
         shells=shells,
         overlapping=overlapping,
+        touching=touching,
         size=(x, y, z),
         volume=float(closed_volume),
     )
@@ -268,14 +287,20 @@ def _count_loops(edges: np.ndarray) -> int:
     return int(n)
 
 
-def _nest(vertices: np.ndarray, faces: np.ndarray, shells: list[Shell]) -> list[tuple[int, int]]:
-    """Set ``depth`` and ``parent`` of closed shells and return partially overlapping pairs.
+def _nest(vertices: np.ndarray, faces: np.ndarray, shells: list[Shell]) -> tuple[
+        list[tuple[int, int]], list[tuple[int, int]], dict[int, Manifold]]:
+    """Set ``depth`` and ``parent`` of closed shells and find pairs that overlap or touch.
 
     ``faces`` must be consistently oriented within each shell.
+
+    Returns:
+        Pairs of closed shells that partially overlap, pairs that touch over
+        an area without overlapping, and each closed shell as an
+        outward-oriented solid (where it is a valid manifold).
     """
-    closed = [i for i, s in enumerate(shells) if s.closed]
+    closed = [i for i, s in enumerate(shells) if s.closed and not s.flat]
     if len(closed) < 2:
-        return []
+        return [], [], {}
 
     solids: dict[int, Manifold] = {}
     lo, hi, vol = {}, {}, {}
@@ -292,7 +317,7 @@ def _nest(vertices: np.ndarray, faces: np.ndarray, shells: list[Shell]) -> list[
         lo[i], hi[i] = vertices[used].min(axis=0), vertices[used].max(axis=0)
         vol[i] = abs(shells[i].volume)
 
-    overlapping = []
+    overlapping, touching = [], []
     enclosing: dict[int, list[int]] = {}
     for a_pos, a in enumerate(closed):
         for b in closed[a_pos + 1:]:
@@ -302,6 +327,10 @@ def _nest(vertices: np.ndarray, faces: np.ndarray, shells: list[Shell]) -> list[
             if a in solids and b in solids:
                 common = (solids[a] ^ solids[b]).volume()
                 if common <= _VOLUME_RTOL * vol[small]:
+                    # The union fuses solids touching over an area, not
+                    # those touching only along an edge or at a point.
+                    if len((solids[a] + solids[b]).decompose()) == 1:
+                        touching.append((a, b))
                     continue
                 if common < (1 - _VOLUME_RTOL) * vol[small]:
                     overlapping.append((a, b))
@@ -311,7 +340,25 @@ def _nest(vertices: np.ndarray, faces: np.ndarray, shells: list[Shell]) -> list[
                 enclosing.setdefault(small, []).append(big)
     for i, outer in enclosing.items():
         shells[i].parent = max(outer, key=lambda j: shells[j].depth)
-    return overlapping
+    return overlapping, touching, solids
+
+
+def _total_volume(shells: list[Shell], overlapping: list[tuple[int, int]],
+                  solids: dict[int, Manifold]) -> float:
+    """Sum the volumes of closed shells, counting each group of overlapping solids once."""
+    volume = {i: s.volume for i, s in enumerate(shells) if s.closed}
+    if overlapping:
+        pairs = np.array(overlapping)
+        _, group = connected_components(adjacency(pairs[:, 0], pairs[:, 1], len(shells)), directed=False)
+        involved = np.unique(pairs)
+        for g in np.unique(group[involved]):
+            members = [int(i) for i in involved if group[i] == g]
+            if all(i in solids and volume[i] > 0 for i in members):
+                union = reduce(lambda a, b: a + b, (solids[i] for i in members))
+                for i in members:
+                    volume[i] = 0.0
+                volume[members[0]] = union.volume()
+    return float(sum(volume.values()))
 
 
 def _self_intersecting(vertices: np.ndarray, faces: np.ndarray, shells: list[Shell]) -> np.ndarray:
@@ -406,15 +453,35 @@ def _probe(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
 
 
 def _inside(vertices: np.ndarray, faces: np.ndarray, point: np.ndarray) -> bool:
-    """Return whether ``point`` lies inside the closed surface ``faces``.
+    """Return whether ``point`` lies inside the closed surface ``faces``."""
+    return bool(inside(vertices, faces, point[None])[0])
+
+
+def inside(vertices: np.ndarray, faces: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """Return for each point whether it lies inside the closed surface ``faces``.
 
     Uses the winding number (sum of solid angles, Van Oosterom–Strackee),
-    which is ±1 inside and 0 outside regardless of orientation sign.
+    which is ±1 inside and 0 outside regardless of orientation sign. Memory
+    use is bounded by testing a few points at a time.
+
+    Args:
+        vertices: ``(n, 3)`` float array of vertex positions.
+        faces: ``(m, 3)`` int array of a closed surface.
+        points: ``(k, 3)`` float array of query points.
+
+    Returns:
+        ``(k,)`` bool array.
     """
-    a, b, c = (vertices[faces[:, k]] - point for k in range(3))
-    la, lb, lc = (np.linalg.norm(v, axis=1) for v in (a, b, c))
-    num = np.einsum("ij,ij->i", a, np.cross(b, c))
-    den = (la * lb * lc + np.einsum("ij,ij->i", a, b) * lc
-           + np.einsum("ij,ij->i", b, c) * la + np.einsum("ij,ij->i", c, a) * lb)
-    winding = np.arctan2(num, den).sum() / (2 * np.pi)
-    return abs(winding) > 0.5
+    tri = vertices[faces]
+    batch = max(1, _WINDING_BATCH // max(len(faces), 1))
+    result = np.zeros(len(points), dtype=bool)
+    for start in range(0, len(points), batch):
+        p = points[start:start + batch, None, :]
+        a, b, c = (tri[None, :, k] - p for k in range(3))
+        la, lb, lc = (np.linalg.norm(v, axis=2) for v in (a, b, c))
+        num = np.einsum("pij,pij->pi", a, np.cross(b, c))
+        den = (la * lb * lc + np.einsum("pij,pij->pi", a, b) * lc
+               + np.einsum("pij,pij->pi", b, c) * la + np.einsum("pij,pij->pi", c, a) * lb)
+        winding = np.arctan2(num, den).sum(axis=1) / (2 * np.pi)
+        result[start:start + batch] = np.abs(winding) > 0.5
+    return result

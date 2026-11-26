@@ -6,12 +6,14 @@ problem it addresses:
 1. Remove collapsed triangles (repeated vertex) and duplicate triangles.
 2. Flip misoriented triangles.
 3. Split non-manifold edges so every body becomes its own shell.
-4. Rebuild shells that are still open or degenerate with pymeshfix, one
-   shell at a time; leftovers that enclose no volume are removed.
-5. Merge overlapping shells into one solid with a boolean union.
+4. Rebuild shells that are still open with pymeshfix, one shell at a time;
+   leftovers that enclose no volume are removed.
+5. Merge overlapping shells, and shells touching over an area, into one
+   solid with a boolean union.
+6. Optionally fill cavities: remove every closed shell enclosed by another.
 
-Separate shells and cavities are kept as they are. Self-intersecting shells
-are not repaired.
+Separate shells are kept, and so are cavities unless filling is requested.
+Self-intersecting shells are not repaired.
 """
 
 from dataclasses import dataclass
@@ -19,14 +21,34 @@ from functools import reduce
 
 import numpy as np
 import pymeshfix
+import rtree
 import trimesh
 from manifold3d import Manifold, Mesh64
 from scipy.sparse.csgraph import connected_components
+from scipy.spatial import cKDTree
 
-from meshck.analysis import Analysis, adjacency, analyze, edge_ids
+from meshck.analysis import FLAT_VOLUME_RTOL, Analysis, adjacency, analyze, edge_ids, inside
 
 # Surface samples per changed original triangle for the deviation estimate.
 _SAMPLES_PER_TRIANGLE = 4
+
+# At most this many changed triangles are sampled for the deviation estimate,
+# and points are measured in chunks of _DEVIATION_CHUNK (bounds memory use).
+_MAX_DEVIATION_TRIANGLES = 20_000
+_DEVIATION_CHUNK = 20_000
+
+# Triangles with the nearest bounding boxes checked per deviation sample.
+_DISTANCE_CANDIDATES = 16
+
+# Deviation samples tested at once for lying inside the repaired solid.
+_INSIDE_BATCH = 64
+
+# An open shell thinner than this fraction of its size counts as flat.
+_FLAT_RTOL = 1e-6
+
+# Vertices pymeshfix moved by less than this fraction of the part size are
+# snapped back to their original position.
+_SNAP_RTOL = 1e-6
 
 
 @dataclass
@@ -51,7 +73,8 @@ class RepairResult:
     deviation: float
 
 
-def repair(vertices: np.ndarray, faces: np.ndarray, analysis: Analysis | None = None) -> RepairResult:
+def repair(vertices: np.ndarray, faces: np.ndarray, analysis: Analysis | None = None,
+           fill_cavities: bool = False) -> RepairResult:
     """Repair a mesh so that it is closed, oriented and free of overlaps.
 
     Args:
@@ -59,6 +82,8 @@ def repair(vertices: np.ndarray, faces: np.ndarray, analysis: Analysis | None = 
             duplicate vertices already merged.
         faces: ``(m, 3)`` int array of vertex indices per triangle.
         analysis: ``analyze(vertices, faces)``, if already computed.
+        fill_cavities: Also remove all shells enclosed by another shell, so
+            that only the outer surfaces remain.
 
     Returns:
         The repaired mesh and a log of what was done. If nothing needed
@@ -69,7 +94,10 @@ def repair(vertices: np.ndarray, faces: np.ndarray, analysis: Analysis | None = 
     v, f, steps = v0, f0, []
     result = analysis or analyze(v0, f0)
 
-    for step in (_clean, _orient, _split_nonmanifold, _rebuild_shells, _union_overlapping, _orient):
+    pipeline = [_clean, _orient, _split_nonmanifold, _rebuild_shells, _union_overlapping, _orient]
+    if fill_cavities:
+        pipeline.append(_fill_cavities)
+    for step in pipeline:
         changed = step(v, f, result)
         if changed is not None:
             v, f, message = changed
@@ -158,54 +186,98 @@ def _split_nonmanifold(vertices: np.ndarray, faces: np.ndarray, result: Analysis
 
 
 def _rebuild_shells(vertices: np.ndarray, faces: np.ndarray, result: Analysis) -> Step:
-    """Run pymeshfix on every shell that is open or has degenerate triangles."""
-    broken = [s for s in result.shells if not s.closed or result.degenerate[s.faces].any()]
-    if not broken:
+    """Run pymeshfix on every open shell and remove flat closed shells.
+
+    If pymeshfix returns nothing or a flat leftover, the shell is removed if
+    it is flat itself (stray triangles, flat sheets) and otherwise kept
+    unchanged. Closed shells that are flat enclose no volume and are removed
+    too. Nothing is removed if that would leave no triangles at all.
+    """
+    flat_closed = [s for s in result.shells if s.flat]
+    broken = [s for s in result.shells if not s.closed]
+    if not broken and not flat_closed:
         return None
 
     keep = np.ones(len(faces), dtype=bool)
     parts_v, parts_f, offset = [vertices], [], len(vertices)
-    rebuilt, removed, removed_tris = 0, 0, 0
+    rebuilt, removed = 0, list(flat_closed)
+    removed_tris = sum(len(s.faces) for s in flat_closed)
     for shell in broken:
-        keep[shell.faces] = False
         used, local = np.unique(faces[shell.faces], return_inverse=True)
-        fix = pymeshfix.MeshFix(vertices[used], local.reshape(-1, 3))
+        local = local.reshape(-1, 3)
+        fix = pymeshfix.MeshFix(vertices[used], local)
         fix.repair(joincomp=False, remove_smallest_components=False)
-        if len(fix.faces) == 0 or _is_stray(fix.points, fix.faces):
-            removed += 1
-            removed_tris += len(shell.faces)
+        # pymeshfix returns nothing when it gives up; then only a flat shell
+        # is known to be junk. A result without any solid shows the shell
+        # had no thickness (a fin or sheet).
+        no_solid = len(fix.faces) > 0 and not any(
+            s.closed and not s.flat for s in analyze(fix.points, fix.faces).shells)
+        if len(fix.faces) == 0 or no_solid:
+            if no_solid or _is_stray(vertices[used], local):
+                removed.append(shell)
+                removed_tris += len(shell.faces)
             continue
-        parts_v.append(np.asarray(fix.points, dtype=np.float64))
+        keep[shell.faces] = False
+        parts_v.append(_snap(np.asarray(fix.points, dtype=np.float64), vertices[used]))
         parts_f.append(np.asarray(fix.faces, dtype=np.int64) + offset)
         offset += len(fix.points)
         rebuilt += 1
 
+    if removed and removed_tris == keep.sum() and not rebuilt:
+        removed, removed_tris = [], 0
+    for shell in removed:
+        keep[shell.faces] = False
+
     messages = []
     if rebuilt:
-        messages.append(f"rebuilt {rebuilt} open or degenerate shell(s) with pymeshfix")
+        messages.append(f"rebuilt {rebuilt} open shell(s) with pymeshfix")
     if removed:
-        messages.append(f"removed {removed} shell(s) enclosing no volume ({removed_tris} triangles)")
+        messages.append(f"removed {len(removed)} loose surface piece(s) enclosing no volume ({removed_tris} triangles)")
+    if not messages:
+        return None
     return np.vstack(parts_v), np.vstack([faces[keep], *parts_f]), "; ".join(messages)
 
 
-def _is_stray(vertices: np.ndarray, faces: np.ndarray) -> bool:
-    """Return whether a shell is still open and encloses no volume.
+def _snap(points: np.ndarray, original: np.ndarray) -> np.ndarray:
+    """Move points back onto original vertices they differ from only by rounding.
 
-    Such leftovers (single triangles, flat sheets) cannot become solids.
+    pymeshfix shifts vertices it keeps by up to about 1e-7 of the part size;
+    snapping restores their exact positions so unchanged triangles stay
+    unchanged.
+    """
+    tol = _SNAP_RTOL * max(float(np.ptp(original, axis=0).max()), 1.0)
+    dist, nearest = cKDTree(original).query(points, distance_upper_bound=tol)
+    near = np.isfinite(dist)
+    points = points.copy()
+    points[near] = original[nearest[near]]
+    return points
+
+
+def _is_stray(vertices: np.ndarray, faces: np.ndarray) -> bool:
+    """Return whether a shell is open and flat, so it cannot become a solid.
+
+    Such leftovers are single triangles and flat sheets: all their corners
+    lie in one plane.
     """
     if analyze(vertices, faces).boundary_edges == 0:
         return False
-    tri = np.asarray(vertices, dtype=np.float64)[faces]
-    volume = abs(np.einsum("ij,ij->i", tri[:, 0], np.cross(tri[:, 1], tri[:, 2])).sum()) / 6.0
-    return volume <= 1e-9 * max(float(np.ptp(tri.reshape(-1, 3), axis=0).max()), 1.0) ** 3
+    return _is_flat(np.asarray(vertices, dtype=np.float64)[np.unique(faces)])
+
+
+def _is_flat(points: np.ndarray) -> bool:
+    """Return whether all points lie in one plane, up to ``_FLAT_RTOL`` of their extent."""
+    centered = points - points.mean(axis=0)
+    thinnest = np.linalg.svd(centered, full_matrices=False)[2][-1]
+    thickness = float(np.ptp(centered @ thinnest))
+    return thickness <= _FLAT_RTOL * max(float(np.ptp(points, axis=0).max()), 1.0)
 
 
 def _union_overlapping(vertices: np.ndarray, faces: np.ndarray, result: Analysis) -> Step:
-    """Replace each group of overlapping shells by their boolean union."""
-    if not result.overlapping:
+    """Replace each group of overlapping or touching shells by their boolean union."""
+    if not result.overlapping and not result.touching:
         return None
 
-    pairs = np.array(result.overlapping)
+    pairs = np.array(result.overlapping + result.touching)
     _, group = connected_components(adjacency(pairs[:, 0], pairs[:, 1], len(result.shells)),
                                     directed=False)
     involved = np.unique(pairs)
@@ -218,7 +290,9 @@ def _union_overlapping(vertices: np.ndarray, faces: np.ndarray, result: Analysis
         solids = [_solid(vertices, faces, result.shells[i].faces) for i in members]
         if any(s is None for s in solids):
             continue
-        union = reduce(lambda a, b: a + b, solids).to_mesh64()
+        # The union can contain zero-volume slivers where solids touched.
+        pieces = [p for p in reduce(lambda a, b: a + b, solids).decompose() if not _encloses_nothing(p)]
+        union = Manifold.compose(pieces).to_mesh64()
         for i in members:
             keep[result.shells[i].faces] = False
         parts_v.append(np.asarray(union.vert_properties[:, :3], dtype=np.float64))
@@ -229,8 +303,27 @@ def _union_overlapping(vertices: np.ndarray, faces: np.ndarray, result: Analysis
 
     if not merged_groups:
         return None
+    kind = ("overlapping" if not result.touching else
+            "touching" if not result.overlapping else "overlapping or touching")
     return (np.vstack(parts_v), np.vstack([faces[keep], *parts_f]),
-            f"merged {merged_shells} overlapping shells into {merged_groups}")
+            f"merged {merged_shells} {kind} shells into {merged_groups}")
+
+
+def _encloses_nothing(solid: Manifold) -> bool:
+    """Return whether a solid has (almost) no volume for its size."""
+    lo, hi = np.array(solid.bounding_box()).reshape(2, 3)
+    return abs(solid.volume()) <= FLAT_VOLUME_RTOL * max(float((hi - lo).max()), 1.0) ** 3
+
+
+def _fill_cavities(vertices: np.ndarray, faces: np.ndarray, result: Analysis) -> Step:
+    """Remove every closed shell enclosed by another: cavities and anything inside them."""
+    inner = [s for s in result.shells if s.closed and s.depth > 0]
+    if not inner:
+        return None
+    keep = np.ones(len(faces), dtype=bool)
+    for shell in inner:
+        keep[shell.faces] = False
+    return vertices, faces[keep], f"filled cavities: removed {len(inner)} inner shell(s)"
 
 
 def _solid(vertices: np.ndarray, faces: np.ndarray, shell_faces: np.ndarray) -> Manifold | None:
@@ -258,24 +351,62 @@ def _deviation(v0: np.ndarray, f0: np.ndarray, v1: np.ndarray, f1: np.ndarray) -
     Original triangles that reappear unchanged (same corner positions, in
     any order or winding) have distance zero. The others are sampled and
     measured against the repaired surface; samples that end up inside the
-    repaired solid belong to removed inner walls and are ignored.
+    repaired solid belong to removed inner walls and are ignored. If very
+    many triangles changed, a random subset of them is sampled.
     """
     if len(f1) == 0:
         return float("inf")
-    changed = ~np.isin(_triangle_keys(v0, f0), _triangle_keys(v1, f1))
-    if not changed.any():
+    changed = np.flatnonzero(~np.isin(_triangle_keys(v0, f0), _triangle_keys(v1, f1)))
+    if len(changed) == 0:
         return 0.0
+    rng = np.random.default_rng(0)
+    if len(changed) > _MAX_DEVIATION_TRIANGLES:
+        changed = rng.choice(changed, _MAX_DEVIATION_TRIANGLES, replace=False)
 
     tri = v0[f0[changed]]
-    weights = np.random.default_rng(0).dirichlet((1, 1, 1), size=(len(tri), _SAMPLES_PER_TRIANGLE))
+    weights = rng.dirichlet((1, 1, 1), size=(len(tri), _SAMPLES_PER_TRIANGLE))
     points = np.vstack([np.einsum("tsk,tkd->tsd", weights, tri).reshape(-1, 3), tri.reshape(-1, 3)])
-    repaired = trimesh.Trimesh(v1, f1, process=False)
-    _, dist, _ = trimesh.proximity.closest_point(repaired, points)
+    dist = _surface_distance(v1, f1, points)
+    far = np.flatnonzero(dist > 1e-6)
+    if len(far) == 0:
+        return 0.0
+    if not trimesh.Trimesh(v1, f1, process=False).is_watertight:
+        return float(dist[far].max())
+    # The answer is the farthest sample outside the solid: test the farthest
+    # first and stop at the first one outside.
+    far = far[np.argsort(-dist[far])]
+    for start in range(0, len(far), _INSIDE_BATCH):
+        batch = far[start:start + _INSIDE_BATCH]
+        outside = ~inside(v1, f1, points[batch])
+        if outside.any():
+            return float(dist[batch[np.argmax(outside)]])
+    return 0.0
 
-    far = dist > 1e-6
-    if far.any() and repaired.is_watertight:
-        far[far] = ~repaired.contains(points[far])
-    return float(dist[far].max()) if far.any() else 0.0
+
+def _surface_distance(vertices: np.ndarray, faces: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """Return the distance from each point to the nearest of a few candidate triangles.
+
+    The candidates are the triangles with the nearest bounding boxes, so
+    memory stays proportional to the number of points. The result is exact
+    unless the nearest triangle is not among them, in which case it is
+    slightly too large.
+    """
+    tri = vertices[faces]
+    props = rtree.index.Property()
+    props.dimension = 3
+    tree = rtree.index.Index((np.arange(len(tri), dtype=np.int64), tri.min(axis=1), tri.max(axis=1)),
+                             properties=props)
+    # Degenerate triangles give NaN; the nearest vertex bounds every point.
+    dist, _ = cKDTree(vertices).query(points)
+    for start in range(0, len(points), _DEVIATION_CHUNK):
+        chunk = points[start:start + _DEVIATION_CHUNK]
+        ids, counts = tree.nearest_v(chunk, chunk, num_results=_DISTANCE_CANDIDATES, strict=True)
+        owner = np.repeat(np.arange(len(chunk)), counts.astype(np.int64))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            closest = trimesh.triangles.closest_point(tri[ids.astype(np.int64)], chunk[owner])
+        candidate = np.linalg.norm(closest - chunk[owner], axis=1)
+        np.fmin.at(dist, start + owner, candidate)
+    return dist
 
 
 def _triangle_keys(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
